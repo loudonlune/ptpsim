@@ -1,0 +1,219 @@
+From 48a35f513636234bf1128ce5be46758d16d74471 Mon Sep 17 00:00:00 2001
+From: Adam Hassick <ach1062@usnh.edu>
+Date: Tue, 10 Mar 2026 20:52:37 -0400
+Subject: [PATCH v1 3/3] netdevsim: Share PHC across ports of netdevsim
+
+---
+ drivers/net/netdevsim/bus.c       | 50 +++++++++++++++++++++++++++++++
+ drivers/net/netdevsim/dev.c       | 14 ++++++++-
+ drivers/net/netdevsim/netdev.c    | 28 +++++++++++------
+ drivers/net/netdevsim/netdevsim.h |  4 +++
+ 4 files changed, 86 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/net/netdevsim/bus.c b/drivers/net/netdevsim/bus.c
+index f85b1c261dfb..6f05b7b47421 100644
+--- a/drivers/net/netdevsim/bus.c
++++ b/drivers/net/netdevsim/bus.c
+@@ -404,11 +404,61 @@ static ssize_t unlink_device_store(const struct bus_type *bus, const char *buf,
+ }
+ static BUS_ATTR_WO(unlink_device);
+ 
++static ssize_t set_delay_store(const struct bus_type *bus, const char *buf, size_t count)
++{
++	struct netdevsim *nsim;
++	struct net_device *dev;
++	struct net *ns;
++	int netnsfd, ifidx;
++	unsigned int delay_nsec;
++	unsigned int delay_sec;
++	int err = sscanf(buf, "%d:%d %u %u", &netnsfd, &ifidx, &delay_sec, &delay_nsec);
++
++	if (err != 4) {
++		pr_err("Format for setting delay is \"netnsfd:ifidx delay_sec delay_nsec\" (int:int uint uint).\n");
++		return -EINVAL;
++	}
++
++	ns = get_net_ns_by_fd(netnsfd);
++	if (IS_ERR(ns)) {
++		pr_err("Could not find netns with fd: %d\n", netnsfd);
++		return -EINVAL;
++	}
++
++	rtnl_lock();
++	dev = __dev_get_by_index(ns, ifidx);
++	if (!dev) {
++		pr_err("Could not find device with ifindex %u in netnsfd %d\n",
++		       ifidx, netnsfd);
++		err = -EINVAL;
++		goto out_put_netns;
++	}
++
++	if (!netdev_is_nsim(dev)) {
++		pr_err("Device with ifindex %u in netnsfd %d is not a netdevsim\n",
++		       ifidx, netnsfd);
++		err = -EINVAL;
++		goto out_put_netns;
++	}
++
++	nsim = netdev_priv(dev);
++	nsim->delay_sec = delay_sec;
++	nsim->delay_nsec = delay_nsec;
++
++out_put_netns:
++	put_net(ns);
++	rtnl_unlock();
++
++	return !err ? count : err;
++}
++static BUS_ATTR_WO(set_delay);
++
+ static struct attribute *nsim_bus_attrs[] = {
+ 	&bus_attr_new_device.attr,
+ 	&bus_attr_del_device.attr,
+ 	&bus_attr_link_device.attr,
+ 	&bus_attr_unlink_device.attr,
++	&bus_attr_set_delay.attr,
+ 	NULL
+ };
+ ATTRIBUTE_GROUPS(nsim_bus);
+diff --git a/drivers/net/netdevsim/dev.c b/drivers/net/netdevsim/dev.c
+index e82de0fd3157..826dee2ac30b 100644
+--- a/drivers/net/netdevsim/dev.c
++++ b/drivers/net/netdevsim/dev.c
+@@ -1627,6 +1627,7 @@ static int nsim_dev_reload_create(struct nsim_dev *nsim_dev,
+ int nsim_drv_probe(struct nsim_bus_dev *nsim_bus_dev)
+ {
+ 	struct nsim_dev *nsim_dev;
++	struct mock_phc *phc;
+ 	struct devlink *devlink;
+ 	int err;
+ 
+@@ -1707,14 +1708,24 @@ int nsim_drv_probe(struct nsim_bus_dev *nsim_bus_dev)
+ 	if (err)
+ 		goto err_psample_exit;
+ 
++	phc = mock_phc_create(&nsim_dev->nsim_bus_dev->dev);
++	if (IS_ERR(phc)) {
++		err = PTR_ERR(phc);
++		goto err_hwstats_exit;
++	}
++
++	nsim_dev->phc = phc;
++
+ 	err = nsim_dev_port_add_all(nsim_dev, nsim_bus_dev->port_count);
+ 	if (err)
+-		goto err_hwstats_exit;
++		goto err_mock_phc_exit;
+ 
+ 	nsim_dev->esw_mode = DEVLINK_ESWITCH_MODE_LEGACY;
+ 	devl_unlock(devlink);
+ 	return 0;
+ 
++err_mock_phc_exit:
++	mock_phc_destroy(nsim_dev->phc);
+ err_hwstats_exit:
+ 	nsim_dev_hwstats_exit(nsim_dev);
+ err_psample_exit:
+@@ -1776,6 +1787,7 @@ void nsim_drv_remove(struct nsim_bus_dev *nsim_bus_dev)
+ 	struct devlink *devlink = priv_to_devlink(nsim_dev);
+ 
+ 	devl_lock(devlink);
++	mock_phc_destroy(nsim_dev->phc);
+ 	nsim_dev_reload_destroy(nsim_dev);
+ 
+ 	nsim_bpf_dev_exit(nsim_dev);
+diff --git a/drivers/net/netdevsim/netdev.c b/drivers/net/netdevsim/netdev.c
+index 28440dc516cf..6a3929a945ea 100644
+--- a/drivers/net/netdevsim/netdev.c
++++ b/drivers/net/netdevsim/netdev.c
+@@ -187,6 +187,15 @@ static netdev_tx_t nsim_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	ptp_info = mock_phc_get_ptp_info(peer_ns->phc);
+ 	if (ptp_info)
+ 		err = ptp_info->gettime64(ptp_info, &rx_ts);
++
++	if (peer_ns->delay_sec || peer_ns->delay_nsec) {
++		struct timespec64 delay_ts;
++
++		delay_ts.tv_sec = peer_ns->delay_sec;
++		delay_ts.tv_nsec = peer_ns->delay_nsec;
++		rx_ts = timespec64_add_safe(rx_ts, delay_ts);
++	}
++
+ 	skb_hwtstamps(skb)->hwtstamp = timespec64_to_ktime(rx_ts);
+  
+ 	if (unlikely(nsim_forward_skb(dev, peer_dev,
+@@ -1123,14 +1132,14 @@ static void nsim_queue_uninit(struct netdevsim *ns)
+ static int nsim_init_netdevsim(struct netdevsim *ns)
+ {
+ 	struct netdevsim *peer;
+-	struct mock_phc *phc;
++	//struct mock_phc *phc;
+ 	int err;
+ 
+-	phc = mock_phc_create(&ns->nsim_bus_dev->dev);
+-	if (IS_ERR(phc))
+-		return PTR_ERR(phc);
++	// phc = mock_phc_create(&ns->nsim_bus_dev->dev);
++	// if (IS_ERR(phc))
++	// 	return PTR_ERR(phc);
+ 
+-	ns->phc = phc;
++	ns->phc = ns->nsim_dev->phc;
+ 	ns->netdev->netdev_ops = &nsim_netdev_ops;
+ 	ns->netdev->stat_ops = &nsim_stat_ops;
+ 	ns->netdev->queue_mgmt_ops = &nsim_queue_mgmt_ops;
+@@ -1138,7 +1147,8 @@ static int nsim_init_netdevsim(struct netdevsim *ns)
+ 
+ 	err = nsim_udp_tunnels_info_create(ns->nsim_dev, ns->netdev);
+ 	if (err)
+-		goto err_phc_destroy;
++		return err;
++		//goto err_phc_destroy;
+ 
+ 	rtnl_lock();
+ 	err = nsim_queue_init(ns);
+@@ -1186,8 +1196,8 @@ static int nsim_init_netdevsim(struct netdevsim *ns)
+ err_utn_destroy:
+ 	rtnl_unlock();
+ 	nsim_udp_tunnels_info_destroy(ns->netdev);
+-err_phc_destroy:
+-	mock_phc_destroy(ns->phc);
++// err_phc_destroy:
++// 	mock_phc_destroy(ns->phc);
+ 	return err;
+ }
+ 
+@@ -1205,7 +1215,7 @@ static int nsim_init_netdevsim_vf(struct netdevsim *ns)
+ static void nsim_exit_netdevsim(struct netdevsim *ns)
+ {
+ 	nsim_udp_tunnels_info_destroy(ns->netdev);
+-	mock_phc_destroy(ns->phc);
++	//mock_phc_destroy(ns->phc);
+ }
+ 
+ struct netdevsim *nsim_create(struct nsim_dev *nsim_dev,
+diff --git a/drivers/net/netdevsim/netdevsim.h b/drivers/net/netdevsim/netdevsim.h
+index 9fc347708354..649fa2bdf3d7 100644
+--- a/drivers/net/netdevsim/netdevsim.h
++++ b/drivers/net/netdevsim/netdevsim.h
+@@ -154,6 +154,9 @@ struct netdevsim {
+ 	struct netdev_net_notifier nn;
+ 
+ 	struct kernel_hwtstamp_config tstamp_config;
++
++	u32 delay_sec;
++	u32 delay_nsec;
+ };
+ 
+ struct netdevsim *nsim_create(struct nsim_dev *nsim_dev,
+@@ -341,6 +344,7 @@ struct nsim_dev {
+ 	struct nsim_dev_health health;
+ 	struct nsim_dev_hwstats hwstats;
+ 	struct flow_action_cookie *fa_cookie;
++	struct mock_phc *phc;
+ 	spinlock_t fa_cookie_lock; /* protects fa_cookie */
+ 	bool fail_trap_group_set;
+ 	bool fail_trap_policer_set;
+-- 
+2.53.0
+

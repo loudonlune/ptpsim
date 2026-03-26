@@ -1,0 +1,183 @@
+From e7ce3a835da53039e4b2e035a222d77cd0c8d1d8 Mon Sep 17 00:00:00 2001
+From: Adam Hassick <ach1062@usnh.edu>
+Date: Fri, 20 Feb 2026 20:31:04 -0500
+Subject: [PATCH v1 2/3] net/netdevsim: Enable mock hardware timestamping
+
+---
+ drivers/net/netdevsim/ethtool.c   |  9 +++
+ drivers/net/netdevsim/netdev.c    | 93 ++++++++++++++++++++++++++++++-
+ drivers/net/netdevsim/netdevsim.h |  2 +
+ 3 files changed, 102 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/netdevsim/ethtool.c b/drivers/net/netdevsim/ethtool.c
+index 36a201533aae..4bbb1ec4b30f 100644
+--- a/drivers/net/netdevsim/ethtool.c
++++ b/drivers/net/netdevsim/ethtool.c
+@@ -201,6 +201,15 @@ static int nsim_get_ts_info(struct net_device *dev,
+ 	struct netdevsim *ns = netdev_priv(dev);
+ 
+ 	info->phc_index = mock_phc_index(ns->phc);
++	info->so_timestamping = SOF_TIMESTAMPING_TX_SOFTWARE |
++				 SOF_TIMESTAMPING_RX_SOFTWARE |
++				 SOF_TIMESTAMPING_SOFTWARE |
++				 SOF_TIMESTAMPING_TX_HARDWARE |
++				 SOF_TIMESTAMPING_RX_HARDWARE |
++				 SOF_TIMESTAMPING_RAW_HARDWARE;
++	
++	info->tx_types = BIT(HWTSTAMP_TX_OFF) | BIT(HWTSTAMP_TX_ON);
++	info->rx_filters = BIT(HWTSTAMP_FILTER_NONE) | BIT(HWTSTAMP_FILTER_ALL);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/net/netdevsim/netdev.c b/drivers/net/netdevsim/netdev.c
+index 3645ebde049a..28440dc516cf 100644
+--- a/drivers/net/netdevsim/netdev.c
++++ b/drivers/net/netdevsim/netdev.c
+@@ -16,6 +16,7 @@
+ #include <linux/debugfs.h>
+ #include <linux/etherdevice.h>
+ #include <linux/ethtool_netlink.h>
++#include <linux/ptp_clock_kernel.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/netdevice.h>
+@@ -129,8 +130,11 @@ static netdev_tx_t nsim_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	struct netdevsim *peer_ns;
+ 	struct netdev_config *cfg;
+ 	struct nsim_rq *rq;
+-	int rxq;
+-	int dr;
++	struct ptp_clock_info *ptp_info;
++	struct sk_buff *skb_orig;
++	struct timespec64 tx_ts, rx_ts;
++	struct skb_shared_hwtstamps shhwtstamps;
++	int rxq, gen_tx_tstamp, err, dr;
+ 
+ 	rcu_read_lock();
+ 	if (!nsim_ipsec_tx(ns, skb))
+@@ -164,10 +168,38 @@ static netdev_tx_t nsim_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ 		skb_linearize(skb);
+ 
+ 	skb_tx_timestamp(skb);
++
++	gen_tx_tstamp = skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP;
++
++	if (gen_tx_tstamp) {
++		ptp_info = mock_phc_get_ptp_info(ns->phc);
++		memset(&tx_ts, 0, sizeof(struct timespec64));
++		if (ptp_info)
++			err = ptp_info->gettime64(ptp_info, &tx_ts);
++			
++		skb_orig = skb;
++		skb = skb_copy(skb_orig, GFP_ATOMIC);
++		skb_shinfo(skb_orig)->tx_flags |= SKBTX_IN_PROGRESS;
++	}
++
++	memset(&rx_ts, 0, sizeof(struct timespec64));
++
++	ptp_info = mock_phc_get_ptp_info(peer_ns->phc);
++	if (ptp_info)
++		err = ptp_info->gettime64(ptp_info, &rx_ts);
++	skb_hwtstamps(skb)->hwtstamp = timespec64_to_ktime(rx_ts);
++ 
+ 	if (unlikely(nsim_forward_skb(dev, peer_dev,
+ 				      skb, rq, psp_ext) == NET_RX_DROP))
+ 		goto out_drop_cnt;
+ 
++	if (gen_tx_tstamp) {
++		memset(&shhwtstamps, 0, sizeof(shhwtstamps));
++		shhwtstamps.hwtstamp = timespec64_to_ktime(tx_ts);
++		skb_tstamp_tx(skb_orig, &shhwtstamps);
++		dev_kfree_skb_any(skb_orig);
++	}
++
+ 	if (!hrtimer_active(&rq->napi_timer))
+ 		hrtimer_start(&rq->napi_timer, us_to_ktime(5), HRTIMER_MODE_REL);
+ 
+@@ -338,6 +370,61 @@ static int nsim_set_vf_link_state(struct net_device *dev, int vf, int state)
+ 	return 0;
+ }
+ 
++static int nsim_get_ts_config(struct net_device *netdev, struct kernel_hwtstamp_config *config)
++{
++	struct netdevsim *ns = netdev_priv(netdev);
++	*config = ns->tstamp_config;
++
++	return 0;
++}
++
++static int nsim_set_ts_config(struct net_device *netdev,
++							  struct kernel_hwtstamp_config *config,
++							  struct netlink_ext_ack *extack)
++{
++	struct netdevsim *ns = netdev_priv(netdev);
++
++	if (!ns->phc)
++		return -EOPNOTSUPP;
++
++	switch (config->tx_type) {
++	case HWTSTAMP_TX_OFF:
++		ns->tstamp_config.tx_type = HWTSTAMP_TX_OFF;
++		break;
++	case HWTSTAMP_TX_ON:
++		ns->tstamp_config.tx_type = HWTSTAMP_TX_ON;
++		break;
++	default:
++		return -ERANGE;
++	}
++
++	switch (config->rx_filter) {
++	case HWTSTAMP_FILTER_NONE:
++		ns->tstamp_config.rx_filter = HWTSTAMP_FILTER_NONE;
++		break;
++	case HWTSTAMP_FILTER_PTP_V1_L4_EVENT:
++	case HWTSTAMP_FILTER_PTP_V1_L4_SYNC:
++	case HWTSTAMP_FILTER_PTP_V1_L4_DELAY_REQ:
++	case HWTSTAMP_FILTER_PTP_V2_EVENT:
++	case HWTSTAMP_FILTER_PTP_V2_L4_EVENT:
++	case HWTSTAMP_FILTER_PTP_V2_SYNC:
++	case HWTSTAMP_FILTER_PTP_V2_L4_SYNC:
++	case HWTSTAMP_FILTER_PTP_V2_DELAY_REQ:
++	case HWTSTAMP_FILTER_PTP_V2_L4_DELAY_REQ:
++#ifdef HAVE_HWTSTAMP_FILTER_NTP_ALL
++	case HWTSTAMP_FILTER_NTP_ALL:
++#endif
++	case HWTSTAMP_FILTER_ALL:
++
++		ns->tstamp_config.rx_filter = HWTSTAMP_FILTER_ALL;
++		break;
++	default:
++		return -ERANGE;
++	}
++
++	return 0;
++}
++
+ static void nsim_taprio_stats(struct tc_taprio_qopt_stats *stats)
+ {
+ 	stats->window_drops = 0;
+@@ -662,6 +749,8 @@ static const struct net_device_ops nsim_netdev_ops = {
+ 	.ndo_bpf		= nsim_bpf,
+ 	.ndo_open		= nsim_open,
+ 	.ndo_stop		= nsim_stop,
++	.ndo_hwtstamp_get	= nsim_get_ts_config,
++	.ndo_hwtstamp_set	= nsim_set_ts_config,
+ 	.net_shaper_ops		= &nsim_shaper_ops,
+ };
+ 
+diff --git a/drivers/net/netdevsim/netdevsim.h b/drivers/net/netdevsim/netdevsim.h
+index f767fc8a7505..9fc347708354 100644
+--- a/drivers/net/netdevsim/netdevsim.h
++++ b/drivers/net/netdevsim/netdevsim.h
+@@ -152,6 +152,8 @@ struct netdevsim {
+ 
+ 	struct notifier_block nb;
+ 	struct netdev_net_notifier nn;
++
++	struct kernel_hwtstamp_config tstamp_config;
+ };
+ 
+ struct netdevsim *nsim_create(struct nsim_dev *nsim_dev,
+-- 
+2.53.0
+

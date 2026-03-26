@@ -1,0 +1,48 @@
+From 7a96bd80e3c9a82ceab83ca5de93a711e11f312e Mon Sep 17 00:00:00 2001
+From: Adam Hassick <ach1062@usnh.edu>
+Date: Fri, 20 Feb 2026 20:30:22 -0500
+Subject: [PATCH v1 1/3] ptp_mock: Expose ptp_clock_info
+
+---
+ drivers/ptp/ptp_mock.c   | 6 ++++++
+ include/linux/ptp_mock.h | 6 +++++-
+ 2 files changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/ptp/ptp_mock.c b/drivers/ptp/ptp_mock.c
+index 4d66b6147121..f3f7b44a6b5b 100644
+--- a/drivers/ptp/ptp_mock.c
++++ b/drivers/ptp/ptp_mock.c
+@@ -115,6 +115,12 @@ int mock_phc_index(struct mock_phc *phc)
+ }
+ EXPORT_SYMBOL_GPL(mock_phc_index);
+ 
++struct ptp_clock_info *mock_phc_get_ptp_info(struct mock_phc *phc)
++{
++	return &phc->info;
++}
++EXPORT_SYMBOL_GPL(mock_phc_get_ptp_info);
++
+ struct mock_phc *mock_phc_create(struct device *dev)
+ {
+ 	struct mock_phc *phc;
+diff --git a/include/linux/ptp_mock.h b/include/linux/ptp_mock.h
+index 72eb401034d9..22e112d59b83 100644
+--- a/include/linux/ptp_mock.h
++++ b/include/linux/ptp_mock.h
+@@ -16,8 +16,12 @@ struct mock_phc;
+ struct mock_phc *mock_phc_create(struct device *dev);
+ void mock_phc_destroy(struct mock_phc *phc);
+ int mock_phc_index(struct mock_phc *phc);
+-
++struct ptp_clock_info *mock_phc_get_ptp_info(struct mock_phc *phc);
+ #else
++static inline struct ptp_clock_info *mock_phc_get_ptp_info(struct mock_phc *phc)
++{
++	return NULL;
++}
+ 
+ static inline struct mock_phc *mock_phc_create(struct device *dev)
+ {
+-- 
+2.53.0
+
