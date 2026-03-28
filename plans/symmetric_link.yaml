@@ -1,0 +1,38 @@
+
+experiment: 'symmetric_delay'
+parameters:
+  # 10 ms increase in 10 steps over 10 seconds
+  # Servo should adjust without fault
+- base_delay: {'sec': 0, 'nsec': 1000000}
+  delay_increase: {'sec': 0, 'nsec': 10000000}
+  warmup_time: 30.0
+  ramp_up: {'steps': 10, 'duration': 10.0}
+  settle_time: 60.0
+  # 10 ms increase in 1 step
+  # Servo may have a sync fault
+- base_delay: {'sec': 0, 'nsec': 1000000}
+  delay_increase: {'sec': 0, 'nsec': 10000000}
+  warmup_time: 30.0
+  ramp_up: {'steps': 1, 'duration': 0.0}
+  settle_time: 60.0
+  # 1 s increase in 25 steps over 30 seconds
+  # Servo should adjust without fault
+- base_delay: {'sec': 0, 'nsec': 1000000}
+  delay_increase: {'sec': 1, 'nsec': 0}
+  warmup_time: 30.0
+  ramp_up: {'steps': 30, 'duration': 30.0}
+  settle_time: 60.0
+  # 1 s increase in 10 steps over 10 seconds
+  # Not sure what will happen
+- base_delay: {'sec': 0, 'nsec': 1000000}
+  delay_increase: {'sec': 1, 'nsec': 0}
+  warmup_time: 30.0
+  ramp_up: {'steps': 10, 'duration': 10.0}
+  settle_time: 60.0
+  # 1 s increase in 1 step
+  # Expected: clock has a sync fault
+- base_delay: {'sec': 0, 'nsec': 1000000}
+  delay_increase: {'sec': 1, 'nsec': 0}
+  warmup_time: 30.0
+  ramp_up: {'steps': 1, 'duration': 0.0}
+  settle_time: 60.0

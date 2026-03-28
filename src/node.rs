@@ -42,7 +42,7 @@ impl PTPNode {
         &self.ns.name
     }
 
-    pub async fn new(ns: Arc<NetNamespace>, last_id: u32, num_ports: u8, ptp4l_args: &[&str]) -> Self {
+    pub async fn new(ns: Arc<NetNamespace>, last_id: u32, num_ports: u8, ptp4l_args: &[&str], output_dir: &str) -> Self {
         let device = Arc::new(NetdevsimDevice::new(ns.clone(), last_id + 1, num_ports, 1).await.expect("Failed to create netdevsim device"));
         let mut args = vec![];
 
@@ -60,10 +60,10 @@ impl PTPNode {
         let mut ptp4l_process = ns.spawn_command_in_namespace_piped("ptp4l", args.as_slice())
             .await
             .expect("Failed to spawn ptp4l");
-        let log_file = File::create(format!("{}/ptp4l_{}.log", LOG_BASE_DIR, ns.name))
+        let log_file = File::create(format!("{}/ptp4l_{}.log", output_dir, ns.name))
             .await
             .expect("Failed to create log file");
-        let log_file_stderr = File::create(format!("{}/ptp4l_{}_stderr.log", LOG_BASE_DIR, ns.name))
+        let log_file_stderr = File::create(format!("{}/ptp4l_{}_stderr.log", output_dir, ns.name))
             .await
             .expect("Failed to create stderr log file");
 

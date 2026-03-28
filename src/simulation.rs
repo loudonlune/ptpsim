@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
-use crate::{netdevsim::LinkedDevices, netns::NetNamespace, node::PTPNode, topology::Topology};
+use crate::{Args, netdevsim::LinkedDevices, netns::NetNamespace, node::PTPNode, topology::Topology};
 
 pub struct Simulation {
     nodes: Vec<PTPNode>,
@@ -16,7 +16,7 @@ impl Simulation {
         self.nodes.iter().find(|n| n.name() == name)
     }
 
-    pub async fn add_node(&mut self, name: &str, num_ports: u8, ptp4l_args: &[&str], tshark: bool) -> Result<(), String> {
+    pub async fn add_node(&mut self, name: &str, num_ports: u8, ptp4l_args: &[&str], tshark: bool, output_dir: &str) -> Result<(), String> {
         if self.nodes.iter().any(|n| n.name() == name) {
             return Err(format!("Node with name {} already exists", name));
         }
@@ -25,10 +25,10 @@ impl Simulation {
         let ns = Arc::new(NetNamespace::create_namespace(name).await?);
         ns.bring_up_loopback().await?;
 
-        let mut node = PTPNode::new(ns.clone(), last_id, num_ports, ptp4l_args).await;
+        let mut node = PTPNode::new(ns.clone(), last_id, num_ports, ptp4l_args, output_dir).await;
 
         if tshark {
-            let output_file = format!("{}/tshark_{}.pcap", crate::node::LOG_BASE_DIR, name);
+            let output_file = format!("{}/tshark_{}.pcap", output_dir, name);
             node.start_tshark(&output_file, &[]).await;
         }
 
@@ -66,11 +66,11 @@ impl Simulation {
         }
     }
 
-    pub async fn from_topology(topology: Topology) -> Result<Simulation, String> {
+    pub async fn from_topology(topology: Topology, args: Args) -> Result<Simulation, String> {
         let mut simulation = Simulation { nodes: vec![], devlinks: vec![] };
 
         for node_config in topology.nodes {
-            simulation.add_node(&node_config.name, node_config.num_ports as u8, &node_config.ptp4l_args.iter().map(|s| s.as_str()).collect::<Vec<&str>>(), node_config.tshark).await?;
+            simulation.add_node(&node_config.name, node_config.num_ports as u8, &node_config.ptp4l_args.iter().map(|s| s.as_str()).collect::<Vec<&str>>(), node_config.tshark, &args.output_dir).await?;
         }
 
         for link in topology.devlinks {

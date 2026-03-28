@@ -1,0 +1,20 @@
+
+# Simple, two node configuration with one link between them.
+
+[[nodes]]
+name        = "node1"
+num_ports   = 1
+tshark      = false
+ptp4l_args  = ["-H", "-m", "-l", "6", "-2"]
+
+[[nodes]]
+name        = "node2"
+num_ports   = 1
+tshark      = false
+ptp4l_args  = ["-H", "-m", "-l", "6", "-2", "--clientOnly=1"]
+
+[[devlinks]]
+dev1     = "node1"
+port1       = 0
+dev2     = "node2"
+port2       = 0
