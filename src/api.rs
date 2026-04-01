@@ -74,8 +74,8 @@ async fn set_delay_handler(_state: State<APIState>, _path: Path<(String, u8)>, _
 }
 
 // Axum server setup and endpoints for controlling the simulation
-pub async fn start_server(simulation: Simulation) {
-    let api_state = APIState { sim: Arc::new(RwLock::new(simulation)) };
+pub async fn run_api_server(simulation: Arc<RwLock<Simulation>>) {
+    let api_state = APIState { sim: simulation.clone() };
     let sim_handle = api_state.sim.clone();
 
     let api_app: Router = Router::new()
@@ -83,6 +83,8 @@ pub async fn start_server(simulation: Simulation) {
         .route("/link/{node1}/{port1}/{node2}/{port2}", axum::routing::post(new_link_handler))
         .route("/link/{node1}/{port1}/{node2}/{port2}", axum::routing::delete(remove_link_handler))
         .with_state(api_state);
+
+    let (shutdown_signal, handle) = Simulation::start_phc_polling(simulation);
 
     println!("Simulation is running. Press Ctrl+C to exit...");
 
@@ -97,6 +99,15 @@ pub async fn start_server(simulation: Simulation) {
 
     // Drop the simulation and wait for clean-up
     println!("Simulation is shutting down...");
+
+    // Signal the PHC polling routine to shut down
+    {
+        let mut shutdown = shutdown_signal.write().await;
+        *shutdown = true;
+    }
+
+    // Wait for the PHC polling routine to finish
+    handle.await.expect("Failed to wait for PHC polling routine to finish");
 
     let sim = match Arc::try_unwrap(sim_handle) {
         Ok(lock) => lock.into_inner(),

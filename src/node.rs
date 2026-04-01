@@ -5,8 +5,6 @@ use tokio::io::AsyncBufReadExt;
 
 use crate::{netdevsim::{NetdevsimDevice, NetdevsimPort}, netns::NetNamespace};
 
-pub static LOG_BASE_DIR: &str = "ptpsim_node_logs";
-
 async fn file_log_update_routine(stdout: impl AsyncRead + Unpin, mut log_file: File) {
     let mut stdout_reader = BufReader::new(stdout);
 
@@ -27,6 +25,7 @@ async fn file_log_update_routine(stdout: impl AsyncRead + Unpin, mut log_file: F
 }
 
 pub struct PTPNode {
+    output_dir: String,
     ns: Arc<NetNamespace>,
     device: Arc<NetdevsimDevice>,
     ptp4l_process: Arc<RwLock<Child>>,
@@ -38,8 +37,20 @@ impl PTPNode {
         self.device.clone()
     }
 
+    pub fn namespace(&self) -> Arc<NetNamespace> {
+        self.ns.clone()
+    }
+
+    pub fn phc_index(&self) -> u32 {
+        self.device.phc_index
+    }
+
     pub fn name(&self) -> &str {
         &self.ns.name
+    }
+
+    pub fn output_dir(&self) -> &str {
+        &self.output_dir
     }
 
     pub async fn new(ns: Arc<NetNamespace>, last_id: u32, num_ports: u8, ptp4l_args: &[&str], output_dir: &str) -> Self {
@@ -107,6 +118,7 @@ impl PTPNode {
             device,
             ptp4l_process,
             tshark_process: None,
+            output_dir: output_dir.to_string(),
         }
     }
 

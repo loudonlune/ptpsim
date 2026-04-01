@@ -25,6 +25,10 @@ class Timespec(BaseModel):
 
         return Timespec(sec=total_sec, nsec=total_nsec)
     
+    def multiply(self, multiplier: int) -> 'Timespec':
+        total_nsec = (self.sec * 1_000_000_000 + self.nsec) * multiplier
+        return Timespec(sec=total_nsec // 1_000_000_000, nsec=total_nsec % 1_000_000_000)
+
     def divide(self, divisor: int) -> 'Timespec':
         total_nsec = self.sec * 1_000_000_000 + self.nsec
         divided_nsec = total_nsec // divisor

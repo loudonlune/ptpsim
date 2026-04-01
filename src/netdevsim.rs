@@ -87,6 +87,7 @@ impl NetdevsimPort {
 
 pub struct NetdevsimDevice {
     pub ident: u32,
+    pub phc_index: u32,
     pub ports: Vec<Arc<NetdevsimPort>>,
     pub namespace: Arc<NetNamespace>,
 }
@@ -136,8 +137,33 @@ impl NetdevsimDevice {
             }));
         }
 
+        let phc_index: String = {
+            let output = in_namespace.run_command_in_namespace("ethtool", &["-T", &devports[0].name])
+            .await
+            .expect("Failed to run ethtool");
+
+            let mut phc_index = None;
+
+            println!("ethtool output:\n{}", output);
+
+            for line in output.lines() {
+                if line.trim().starts_with("Hardware timestamp provider index:") {
+                    phc_index = Some(line.trim().split(':').nth(1).unwrap().trim().to_string());
+                }
+            }
+
+            if let Some(index) = phc_index {
+                index
+            } else {
+                return Err("Failed to find PTP Hardware Clock index from ethtool output".to_string());
+            }
+        };
+
+        let phc_index: u32 = phc_index.parse().map_err(|e| format!("Failed to parse PHC index: {}", e))?;
+
         Ok(NetdevsimDevice {
             ident: id,
+            phc_index: phc_index,
             ports: devports,
             namespace: in_namespace,
         })
