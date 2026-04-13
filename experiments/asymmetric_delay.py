@@ -1,10 +1,10 @@
 
 from pydantic import BaseModel
 
-from lib.utils import Timespec
-from lib import Experiment, register_experiment
-from lib.ptpsim import *
-from symmetric_delay import LinearRampUpParameters
+from experiments.lib.utils import Timespec
+from experiments.lib import Experiment, register_experiment
+from experiments.lib.ptpsim import *
+from experiments.symmetric_delay import LinearRampUpParameters
 
 class AsymmetricDelayParameters(BaseModel):
     base_delay: Timespec
@@ -46,3 +46,4 @@ class AsymmetricDelayExperiment(Experiment):
         time.sleep(self.parameters.settle_time)
         stop_ptpsim()
         
+register_experiment("asymmetric_delay", AsymmetricDelayExperiment())

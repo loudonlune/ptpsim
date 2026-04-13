@@ -60,14 +60,9 @@ async fn set_delay_handler(_state: State<APIState>, _path: Path<(String, u8)>, _
     let delay = _delay.0;
 
     if let Some(node) = state.get_node_mut(&node_name) {
-        if let Some(port) = node.device().ports.get(port_index as usize) {
-            match port.set_delay(delay.sec, delay.nsec).await {
-                Ok(_) => format!("Set delay of {} sec and {} nsec on node {} port {}", delay.sec, delay.nsec, node_name, port_index),
-                Err(e) => format!("Failed to set delay on node {} port {}: {}", node_name, port_index, e),
-            }
-        } else {
-            return format!("Port index {} out of range for node {}", port_index, node_name);
-        }
+        node.set_delay(port_index as u8, delay.sec, delay.nsec).await
+            .map(|_| format!("Set delay on node {} port {} to {} sec and {} nsec", node_name, port_index, delay.sec, delay.nsec))
+            .unwrap_or_else(|e| format!("Failed to set delay on node {} port {}: {}", node_name, port_index, e))
     } else {
         return format!("Node {} not found", node_name);
     }

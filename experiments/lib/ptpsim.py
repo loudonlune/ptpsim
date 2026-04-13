@@ -26,7 +26,6 @@ def start_ptpsim(topology_path: str, output_dir: str) -> subprocess.Popen:
     ptpsim_process = process
 
     time.sleep(1)  # Wait a moment for the simulator to start
-    print('Process: ', str(type(ptpsim_process)))
 
     return process
 
@@ -46,9 +45,6 @@ def check_ptpsim_running() -> bool:
             print('LOG: ', ptpsim_process.stdout.read().decode())
             print('ERR: ', ptpsim_process.stderr.read().decode())
             ptpsim_process = None
-
-    print('Process: ', str(type(ptpsim_process)))
-
 
     return ptpsim_process is not None
 

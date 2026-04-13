@@ -1,20 +1,38 @@
-use std::{sync::Arc};
+use std::{sync::Arc, time::Instant};
 
-use tokio::{fs::File, io::{AsyncRead, AsyncWriteExt, BufReader}, process::Child, sync::RwLock};
+use regex::Regex;
+use tokio::{io::{AsyncRead, BufReader}, process::Child, sync::{RwLock, mpsc::Sender}};
 use tokio::io::AsyncBufReadExt;
 
-use crate::{netdevsim::{NetdevsimDevice, NetdevsimPort}, netns::NetNamespace};
+use crate::{netdevsim::{NetdevsimDevice, NetdevsimPort}, netns::NetNamespace, sim_logger::Message};
 
-async fn file_log_update_routine(stdout: impl AsyncRead + Unpin, mut log_file: File) {
+async fn ptp4l_message_send_routine(stdout: impl AsyncRead + Unpin, channel: Sender<Message>, node_name: String, epoch: Instant) {
     let mut stdout_reader = BufReader::new(stdout);
+    
+    // Regex to extract master offset, state value, frequency adjustment, and path delay from ptp4l log lines
+    // Example: ptp4l[3488.724]: master offset       -749 s2 freq     -38 path delay   1001829
+    let ptp4l_line_regex = Regex::new(r"ptp4l\[(\d+\.\d+)\]: master offset\s+(-?\d+)\s+([a-z0-9]+)\s+freq\s+[+]{0,1}(-?\d+)\s+path delay\s+(\d+)").expect("Failed to compile regex");
 
     loop {
         let mut buffer = String::new();
         match stdout_reader.read_line(&mut buffer).await {
             Ok(0) => break, // EOF
             Ok(_) => {
-                log_file.write_all(buffer.as_bytes()).await.expect("Failed to write to log file");
-                log_file.flush().await.expect("Failed to flush log file");
+                // Use regex to parse the line and extract relevant information
+                if let Some(captures) = ptp4l_line_regex.captures(&buffer) {
+                    let offset_from_master = captures.get(2).unwrap().as_str().parse::<f64>().unwrap_or(0.0);
+                    let state = captures.get(3).unwrap().as_str().to_string();
+                    let frequency = captures.get(4).unwrap().as_str().parse::<f64>().unwrap_or(0.0);
+                    let path_delay = captures.get(5).unwrap().as_str().parse::<f64>().unwrap_or(0.0);
+                    let relative_timestamp = Instant::now().duration_since(epoch).as_secs_f64();
+
+                    channel.send(Message {
+                        message_type: "Ptp4lLog".to_string(),
+                        node: node_name.clone(),
+                        relative_timestamp: relative_timestamp,
+                        data: crate::sim_logger::MessageData::Ptp4lLog { path_delay, offset_from_master, frequency, state },
+                    }).await.expect("Failed to send message to channel");
+                }
             }
             Err(e) => {
                 eprintln!("Error reading from stdout: {}", e);
@@ -26,8 +44,11 @@ async fn file_log_update_routine(stdout: impl AsyncRead + Unpin, mut log_file: F
 
 pub struct PTPNode {
     output_dir: String,
+    logging_channel: Sender<Message>,
+    epoch: Instant,
     ns: Arc<NetNamespace>,
     device: Arc<NetdevsimDevice>,
+    set_delays: Vec<(u32, u32)>,
     ptp4l_process: Arc<RwLock<Child>>,
     tshark_process: Option<Child>,
 }
@@ -53,7 +74,32 @@ impl PTPNode {
         &self.output_dir
     }
 
-    pub async fn new(ns: Arc<NetNamespace>, last_id: u32, num_ports: u8, ptp4l_args: &[&str], output_dir: &str) -> Self {
+    pub async fn log_current_delay(&self, port_index: u8) {
+        let current_delay = self.set_delays.get(port_index as usize).cloned().expect("Port index out of range");
+        let relative_timestamp = Instant::now().duration_since(self.epoch).as_secs_f64();
+        self.logging_channel.send(Message {
+            message_type: "RealDelay".to_string(),
+            node: self.name().to_string(),
+            relative_timestamp,
+            data: crate::sim_logger::MessageData::RealDelay { delay_sec: current_delay.0, delay_nsec: current_delay.1 },
+        }).await.expect("Failed to send message to channel");
+    }
+
+    pub async fn set_delay(&mut self, port_index: u8, delay_sec: u32, delay_nsec: u32) -> Result<(), String> {
+        self.log_current_delay(port_index).await;
+        self.set_delays[port_index as usize] = (delay_sec, delay_nsec);
+        
+        if let Some(port) = self.device.ports.get(port_index as usize) {
+            port.set_delay(delay_sec, delay_nsec).await?;
+        } else {
+            return Err(format!("Port index {} out of range for node {}", port_index, self.name()))
+        }
+
+        self.log_current_delay(port_index).await;
+        Ok(())
+    }
+
+    pub async fn new(ns: Arc<NetNamespace>, logging_channel: Sender<Message>, last_id: u32, num_ports: u8, ptp4l_args: &[&str], output_dir: &str, epoch: Instant) -> Self {
         let device = Arc::new(NetdevsimDevice::new(ns.clone(), last_id + 1, num_ports, 1).await.expect("Failed to create netdevsim device"));
         let mut args = vec![];
 
@@ -71,20 +117,16 @@ impl PTPNode {
         let mut ptp4l_process = ns.spawn_command_in_namespace_piped("ptp4l", args.as_slice())
             .await
             .expect("Failed to spawn ptp4l");
-        let log_file = File::create(format!("{}/ptp4l_{}.log", output_dir, ns.name))
-            .await
-            .expect("Failed to create log file");
-        let log_file_stderr = File::create(format!("{}/ptp4l_{}_stderr.log", output_dir, ns.name))
-            .await
-            .expect("Failed to create stderr log file");
 
         let maybe_stdout = ptp4l_process.stdout.take();
         let maybe_stderr = ptp4l_process.stderr.take();
+        let logging_channel2 = logging_channel.clone();
+        let ns2 = ns.clone();
         tokio::spawn(async move {
             let stdout = maybe_stdout.expect("Failed to take stdout");
             let stderr = maybe_stderr.expect("Failed to take stderr");
-            file_log_update_routine(stdout, log_file).await;
-            file_log_update_routine(stderr, log_file_stderr).await;
+            ptp4l_message_send_routine(stdout, logging_channel2.clone(), ns2.name.clone(), epoch).await;
+            ptp4l_message_send_routine(stderr, logging_channel2, ns2.name.clone(), epoch).await;
         });
 
         let ptp4l_process = Arc::new(RwLock::new(ptp4l_process));
@@ -113,11 +155,16 @@ impl PTPNode {
             }
         });
 
+        let set_delays = vec![(0, 0); num_ports as usize];
+
         PTPNode {
+            logging_channel: logging_channel,
+            set_delays,
             ns,
             device,
             ptp4l_process,
             tshark_process: None,
+            epoch,
             output_dir: output_dir.to_string(),
         }
     }
